@@ -71,6 +71,17 @@ The chargeback reverses client 2's deposit and locks the account, so deposit `4`
 cargo test
 ```
 
+- Unit tests sit next to the code: transaction rules and output formatting in
+  `src/client_record.rs`, input parsing in `src/transaction.rs`.
+- End-to-end tests in `tests/end_to_end.rs` run the compiled binary on the cases in
+  `tests/fixtures/<case>/`. Each case holds an `input.csv` and the `expected.csv` output. Rows are
+  compared in any order.
+- Tests named `limitation_*` pin the behavior listed under
+  [Known limitations](#known-limitations) and fail when that behavior changes.
+
+To add an end-to-end case, create `tests/fixtures/<case>/input.csv` and `expected.csv`, then add a
+test that calls `check_fixture("<case>")`.
+
 Formatting and lints:
 
 ```sh
@@ -80,9 +91,10 @@ cargo clippy --all-targets
 
 ## Code layout
 
-- `src/main.rs`: command line handling, CSV reading, one account per client.
-- `src/transaction.rs`: types for an input row.
-- `src/client_record.rs`: account balances and the rules for each transaction type.
+- `src/main.rs`: command line handling, one account per client, writing the output.
+- `src/transaction.rs`: types for an input row and the CSV reader settings.
+- `src/client_record.rs`: account balances, the rules for each transaction type, and output
+  formatting.
 
 ## Design decisions
 
@@ -153,3 +165,5 @@ the deposit is reversed.
   zero-balance account for a client with no other activity.
 - A row that can't be parsed (for example client `abc` or `70000`) stops the run.
 - Deposits and withdrawals of zero are accepted.
+- Balances above about 7.9 × 10^24 are printed with fewer than four decimal places, because the
+  decimal type can't hold four places at that size.
