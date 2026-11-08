@@ -168,6 +168,27 @@ Rows are read one at a time and not kept. Each account stores only what a later 
 A resolved or charged-back deposit is removed. A locked account rejects every later row, so
 everything it stores is freed.
 
+### Concurrent input
+
+The program reads one file on one thread. If rows came from many concurrent streams, accounts
+could be shared without locks:
+
+- No row touches two clients, because disputes, resolves and chargebacks only match transactions
+  of the same client. Each account can have a single owner.
+- `N` worker threads each own the accounts of the clients with `client % N == i` in a `HashMap`,
+  and apply rows with `ClientRecord::update`.
+- Each stream is read and parsed on its own thread or task, which sends every row to its client's
+  worker through a bounded channel. Parsing is most of the work per row and runs in parallel. The
+  bound slows a reader down when a worker falls behind.
+- A channel delivers each sender's messages in the order they were sent, so a stream's rows for a
+  client are applied in stream order.
+- When all streams end, each worker returns its accounts. No client belongs to two workers, so the
+  output is every worker's accounts.
+
+Rows from different streams are applied in the order they arrive. When a client's rows come from
+more than one stream, a dispute can arrive before the deposit it refers to and is then ignored.
+Results are deterministic when each client's rows come from a single stream.
+
 ## Known limitations
 
 - A locked account rejects every later row, including resolves and chargebacks of its other open
