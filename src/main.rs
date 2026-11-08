@@ -16,10 +16,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut clients = HashMap::<ClientId, ClientRecord>::new();
 
-    let mut rdr = csv::ReaderBuilder::new()
-        .trim(csv::Trim::All)
-        .flexible(true)
-        .from_path(input_file)?;
+    let mut rdr = transaction::csv_reader_builder().from_path(input_file)?;
     for result in rdr.deserialize() {
         let transaction: Transaction = result?;
         match clients.entry(transaction.client) {
@@ -39,6 +36,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    let mut writer = csv::WriterBuilder::new()
+        .has_headers(false)
+        .from_writer(std::io::stdout().lock());
+    // Written by hand so the header is present even when there are no accounts.
+    writer.write_record(ClientRecord::CSV_HEADER)?;
+    for client in clients.values() {
+        writer.serialize(client)?;
+    }
+    writer.flush()?;
 
     Ok(())
 }
