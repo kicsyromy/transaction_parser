@@ -1,7 +1,11 @@
-use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
-#[derive(Debug, Serialize, Deserialize)]
+use rust_decimal::Decimal;
+use serde::Deserialize;
+
+use crate::ClientId;
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Deposit,
@@ -10,23 +14,26 @@ pub enum Kind {
     Resolve,
     Chargeback,
     #[serde(untagged)]
+    #[allow(unused)]
     Unknown(String),
 }
 
 #[repr(transparent)]
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClientId(u16);
-
-#[repr(transparent)]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, PartialOrd, Ord, Hash, Copy, Clone, Deserialize)]
 pub struct Id(u32);
 
-#[derive(Debug, Serialize, Deserialize)]
+impl Display for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{}", self.0))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Transaction {
     #[serde(rename = "type")]
-    kind: Kind,
-    client: ClientId,
-    tx: Id,
+    pub kind: Kind,
+    pub client: ClientId,
+    pub tx: Id,
     #[serde(with = "rust_decimal::serde::str_option")]
-    amount: Option<Decimal>,
+    pub amount: Option<Decimal>,
 }

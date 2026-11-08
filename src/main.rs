@@ -1,7 +1,11 @@
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::env::args;
 
+use client_record::{ClientId, ClientRecord};
 use transaction::Transaction;
 
+mod client_record;
 mod transaction;
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -10,12 +14,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
     };
 
+    let mut clients = HashMap::<ClientId, ClientRecord>::new();
+
     let mut rdr = csv::ReaderBuilder::new()
         .trim(csv::Trim::All)
-        .from_path("test_input.csv")?;
+        .from_path(input_file)?;
     for result in rdr.deserialize() {
-        let record: Transaction = result?;
-        println!("{:?}", record);
+        let transaction: Transaction = result?;
+        match clients.entry(transaction.client) {
+            Entry::Occupied(oe) => {
+                let client = oe.into_mut();
+                client.update(&transaction)?;
+            }
+            Entry::Vacant(ve) => {
+                let client = ve.insert(ClientRecord::new(transaction.client));
+                client.update(&transaction)?;
+            }
+        }
     }
 
     Ok(())
