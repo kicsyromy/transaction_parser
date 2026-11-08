@@ -157,6 +157,17 @@ the deposit is reversed.
 - Fatal errors stop the run with exit code `1`: a missing argument, a file that can't be opened,
   or a row that can't be parsed.
 
+### Memory
+
+Rows are read one at a time and not kept. Each account stores only what a later row can refer to:
+
+- deposits that can still be disputed, with their amounts
+- IDs of successful withdrawals, so a dispute of one is reported as such
+- the deposits currently under dispute
+
+A resolved or charged-back deposit is removed. A locked account rejects every later row, so
+everything it stores is freed.
+
 ## Known limitations
 
 - A locked account rejects every later row, including resolves and chargebacks of its other open
@@ -167,3 +178,6 @@ the deposit is reversed.
 - Deposits and withdrawals of zero are accepted.
 - Balances above about 7.9 × 10^24 are printed with fewer than four decimal places, because the
   decimal type can't hold four places at that size.
+- Everything stored stays in memory, with no disk storage. A deposit that can still be disputed
+  takes 24 to 48 bytes (2.4 to 4.8 GB per 100 million), and a successful withdrawal 6 to 11
+  bytes, depending on how full the hash tables are.

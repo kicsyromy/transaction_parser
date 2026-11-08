@@ -43,12 +43,15 @@ pub struct ClientRecord {
     total: Decimal,
     locked: bool,
 
+    /// Successful deposits that can still be disputed.
     #[serde(skip)]
-    transaction_history: Vec<Transaction>,
+    deposits: HashMap<TransactionId, Decimal>,
+    /// Successful withdrawals, kept so a dispute of one is reported as such.
     #[serde(skip)]
-    disputable_transactions: HashMap<TransactionId, usize>,
+    withdrawals: HashSet<TransactionId>,
+    /// Deposits currently under dispute.
     #[serde(skip)]
-    disputed_transactions: HashSet<TransactionId>,
+    disputed: HashSet<TransactionId>,
 }
 
 impl ClientRecord {
@@ -62,15 +65,13 @@ impl ClientRecord {
             total: 0.into(),
             locked: false,
 
-            transaction_history: Vec::new(),
-            disputable_transactions: HashMap::new(),
-            disputed_transactions: HashSet::new(),
+            deposits: HashMap::new(),
+            withdrawals: HashSet::new(),
+            disputed: HashSet::new(),
         }
     }
 
     pub fn update(&mut self, transaction: &Transaction) -> Result<(), UpdateError> {
-        self.transaction_history.push(transaction.clone());
-
         if self.locked {
             return Err(UpdateError::AccountFrozen(transaction.tx, transaction.kind));
         }
@@ -90,8 +91,7 @@ impl ClientRecord {
                 };
                 self.available = available;
 
-                self.disputable_transactions
-                    .insert(transaction.tx, self.transaction_history.len() - 1);
+                self.deposits.insert(transaction.tx, amount);
             }
             TransactionKind::Withdrawal => {
                 let Some(amount) = transaction.amount else {
@@ -111,47 +111,34 @@ impl ClientRecord {
                 };
                 self.available = available;
 
-                self.disputable_transactions
-                    .insert(transaction.tx, self.transaction_history.len() - 1);
+                self.withdrawals.insert(transaction.tx);
             }
             TransactionKind::Dispute => {
-                let Some(disputed) = self
-                    .disputable_transactions
-                    .get(&transaction.tx)
-                    .map(|&i| &self.transaction_history[i])
-                else {
+                let Some(&amount) = self.deposits.get(&transaction.tx) else {
+                    if self.withdrawals.contains(&transaction.tx) {
+                        return Err(UpdateError::DisputeWithdrawal(transaction.tx));
+                    }
                     tracing::warn!("tried to dispute invalid transaction id {}", transaction.tx);
                     return Ok(());
                 };
 
-                if !matches!(disputed.kind, TransactionKind::Deposit) {
-                    return Err(UpdateError::DisputeWithdrawal(transaction.tx));
+                if self.disputed.contains(&transaction.tx) {
+                    return Err(UpdateError::AlreadyDisputed(transaction.tx));
                 }
 
-                let Some(amount) = disputed.amount else {
-                    return Err(UpdateError::MissingAmount(disputed.tx, disputed.kind));
-                };
-
-                if !self.disputed_transactions.insert(disputed.tx) {
-                    return Err(UpdateError::AlreadyDisputed(disputed.tx));
-                }
-
-                let Some(available) = self.available.checked_sub(amount) else {
+                let (Some(available), Some(held)) = (
+                    self.available.checked_sub(amount),
+                    self.held.checked_add(amount),
+                ) else {
                     return Err(UpdateError::Overflow(transaction.tx));
                 };
                 self.available = available;
-
-                let Some(held) = self.held.checked_add(amount) else {
-                    return Err(UpdateError::Overflow(transaction.tx));
-                };
                 self.held = held;
+
+                self.disputed.insert(transaction.tx);
             }
             TransactionKind::Resolve => {
-                let Some(resolved) = self
-                    .disputable_transactions
-                    .get(&transaction.tx)
-                    .map(|&i| &self.transaction_history[i])
-                else {
+                let Some(&amount) = self.deposits.get(&transaction.tx) else {
                     tracing::warn!(
                         "tried to resolve undisputable transaction id {}",
                         transaction.tx
@@ -159,7 +146,7 @@ impl ClientRecord {
                     return Ok(());
                 };
 
-                if !self.disputed_transactions.contains(&resolved.tx) {
+                if !self.disputed.contains(&transaction.tx) {
                     tracing::warn!(
                         "tried to resolve an undisputed transaction id {}",
                         transaction.tx
@@ -167,29 +154,20 @@ impl ClientRecord {
                     return Ok(());
                 }
 
-                let Some(amount) = resolved.amount else {
-                    return Err(UpdateError::MissingAmount(resolved.tx, resolved.kind));
-                };
-
-                let Some(available) = self.available.checked_add(amount) else {
+                let (Some(available), Some(held)) = (
+                    self.available.checked_add(amount),
+                    self.held.checked_sub(amount),
+                ) else {
                     return Err(UpdateError::Overflow(transaction.tx));
                 };
                 self.available = available;
-
-                let Some(held) = self.held.checked_sub(amount) else {
-                    return Err(UpdateError::Overflow(transaction.tx));
-                };
                 self.held = held;
 
-                self.disputed_transactions.remove(&transaction.tx);
-                self.disputable_transactions.remove(&transaction.tx);
+                self.disputed.remove(&transaction.tx);
+                self.deposits.remove(&transaction.tx);
             }
             TransactionKind::Chargeback => {
-                let Some(charged_back) = self
-                    .disputable_transactions
-                    .get(&transaction.tx)
-                    .map(|&i| &self.transaction_history[i])
-                else {
+                let Some(&amount) = self.deposits.get(&transaction.tx) else {
                     tracing::warn!(
                         "tried to chargeback undisputable transaction id {}",
                         transaction.tx
@@ -197,20 +175,13 @@ impl ClientRecord {
                     return Ok(());
                 };
 
-                if !self.disputed_transactions.contains(&charged_back.tx) {
+                if !self.disputed.contains(&transaction.tx) {
                     tracing::warn!(
                         "tried to chargeback an undisputed transaction id {}",
                         transaction.tx
                     );
                     return Ok(());
                 }
-
-                let Some(amount) = charged_back.amount else {
-                    return Err(UpdateError::MissingAmount(
-                        charged_back.tx,
-                        charged_back.kind,
-                    ));
-                };
 
                 let Some(held) = self.held.checked_sub(amount) else {
                     return Err(UpdateError::Overflow(transaction.tx));
@@ -219,8 +190,10 @@ impl ClientRecord {
 
                 self.locked = true;
 
-                self.disputed_transactions.remove(&transaction.tx);
-                self.disputable_transactions.remove(&transaction.tx);
+                // A locked account rejects every later row, so nothing stored is read again.
+                self.deposits = HashMap::new();
+                self.withdrawals = HashSet::new();
+                self.disputed = HashSet::new();
             }
             TransactionKind::Unknown => {
                 return Err(UpdateError::UnknownTransactionType(transaction.tx));
@@ -538,6 +511,39 @@ mod tests {
         assert!(record.update(&tx("deposit, 1, 1, 0")).is_ok());
         assert!(record.update(&tx("withdrawal, 1, 2, 0")).is_ok());
         assert_account(&record, "0", "0", "0", false);
+    }
+
+    #[test]
+    fn stores_only_what_disputes_can_use() {
+        let record = apply(&[
+            "deposit, 1, 1, 10",
+            "deposit, 1, 2, 5",
+            "withdrawal, 1, 3, 1",
+            "withdrawal, 1, 4, 100",
+            "dispute, 1, 1,",
+            "resolve, 1, 1,",
+            "dispute, 1, 2,",
+            "transfer, 1, 5, 1",
+        ]);
+        let id = |n: u32| tx(&format!("dispute, 1, {n},")).tx;
+        assert_eq!(record.deposits, HashMap::from([(id(2), dec("5"))]));
+        assert_eq!(record.withdrawals, HashSet::from([id(3)]));
+        assert_eq!(record.disputed, HashSet::from([id(2)]));
+    }
+
+    #[test]
+    fn chargeback_frees_stored_transactions() {
+        let record = apply(&[
+            "deposit, 1, 1, 10",
+            "deposit, 1, 2, 5",
+            "withdrawal, 1, 3, 1",
+            "dispute, 1, 1,",
+            "dispute, 1, 2,",
+            "chargeback, 1, 1,",
+        ]);
+        assert!(record.deposits.is_empty());
+        assert!(record.withdrawals.is_empty());
+        assert!(record.disputed.is_empty());
     }
 
     #[test]
