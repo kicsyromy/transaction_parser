@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::env::args;
+use std::process::ExitCode;
+use std::{collections::HashMap, io::IsTerminal};
 
 use client_record::{ClientId, ClientRecord};
 use transaction::Transaction;
@@ -9,7 +9,7 @@ mod client_record;
 mod transaction;
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(input_file) = args().skip(1).next() else {
+    let Some(input_file) = std::env::args_os().nth(1) else {
         tracing::error!("No input file was provided");
         return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
     };
@@ -18,17 +18,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut rdr = csv::ReaderBuilder::new()
         .trim(csv::Trim::All)
+        .flexible(true)
         .from_path(input_file)?;
     for result in rdr.deserialize() {
         let transaction: Transaction = result?;
         match clients.entry(transaction.client) {
             Entry::Occupied(oe) => {
                 let client = oe.into_mut();
-                client.update(&transaction)?;
+                if let Err(err) = client.update(&transaction) {
+                    tracing::error!("transaction failed: {err}")
+                }
             }
             Entry::Vacant(ve) => {
-                let client = ve.insert(ClientRecord::new(transaction.client));
-                client.update(&transaction)?;
+                let mut client = ClientRecord::new(transaction.client);
+                if let Err(err) = client.update(&transaction) {
+                    tracing::error!("transaction failed: {err}")
+                } else {
+                    ve.insert(client);
+                }
             }
         }
     }
@@ -36,10 +43,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn main() {
+fn main() -> ExitCode {
     tracing_subscriber::fmt()
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .init();
 
-    run().expect("application execution failed");
+    if let Err(err) = run() {
+        tracing::error!("execution failed: {err}");
+        return ExitCode::FAILURE;
+    }
+
+    ExitCode::SUCCESS
 }

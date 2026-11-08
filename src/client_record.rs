@@ -14,6 +14,18 @@ pub enum UpdateError {
     MissingAmount(TransactionId, TransactionKind),
     #[error("insufficient funds for transaction {0}, type withdrawal")]
     InsufficientFunds(TransactionId),
+    #[error("amount for transaction {0} is negative")]
+    NegativeAmount(TransactionId),
+    #[error("dispute for withdrawal transaction {0}")]
+    DisputeWithdrawal(TransactionId),
+    #[error("transaction {0} is already being disputed")]
+    AlreadyDisputed(TransactionId),
+    #[error("transaction {0}, type {1:?}, failed: account frozen")]
+    AccountFrozen(TransactionId, TransactionKind),
+    #[error("transaction {0} has an unknown type")]
+    UnknownTransactionType(TransactionId),
+    #[error("transaction {0} would overflow/underflow the balance")]
+    Overflow(TransactionId),
 }
 
 #[repr(transparent)]
@@ -32,7 +44,9 @@ pub struct ClientRecord {
     locked: bool,
 
     #[serde(skip)]
-    transaction_history: HashMap<TransactionId, Transaction>,
+    transaction_history: Vec<Transaction>,
+    #[serde(skip)]
+    disputable_transactions: HashMap<TransactionId, usize>,
     #[serde(skip)]
     disputed_transactions: HashSet<TransactionId>,
 }
@@ -46,62 +60,100 @@ impl ClientRecord {
             total: 0.into(),
             locked: false,
 
-            transaction_history: HashMap::new(),
+            transaction_history: Vec::new(),
+            disputable_transactions: HashMap::new(),
             disputed_transactions: HashSet::new(),
         }
     }
 
     pub fn update(&mut self, transaction: &Transaction) -> Result<(), UpdateError> {
-        self.transaction_history
-            .insert(transaction.tx, transaction.clone());
+        self.transaction_history.push(transaction.clone());
+
+        if self.locked {
+            return Err(UpdateError::AccountFrozen(transaction.tx, transaction.kind));
+        }
 
         match transaction.kind {
             TransactionKind::Deposit => {
                 let Some(amount) = transaction.amount else {
-                    return Err(UpdateError::MissingAmount(
-                        transaction.tx,
-                        transaction.kind.clone(),
-                    ));
+                    return Err(UpdateError::MissingAmount(transaction.tx, transaction.kind));
                 };
 
-                self.available += amount;
-                self.total += amount;
+                if amount.is_sign_negative() {
+                    return Err(UpdateError::NegativeAmount(transaction.tx));
+                }
+
+                let Some(available) = self.available.checked_add(amount) else {
+                    return Err(UpdateError::Overflow(transaction.tx));
+                };
+                self.available = available;
+
+                self.disputable_transactions
+                    .insert(transaction.tx, self.transaction_history.len() - 1);
             }
             TransactionKind::Withdrawal => {
                 let Some(amount) = transaction.amount else {
-                    return Err(UpdateError::MissingAmount(
-                        transaction.tx,
-                        transaction.kind.clone(),
-                    ));
+                    return Err(UpdateError::MissingAmount(transaction.tx, transaction.kind));
                 };
+
+                if amount.is_sign_negative() {
+                    return Err(UpdateError::NegativeAmount(transaction.tx));
+                }
 
                 if self.available < amount {
                     return Err(UpdateError::InsufficientFunds(transaction.tx));
                 }
 
-                self.available -= amount;
+                let Some(available) = self.available.checked_sub(amount) else {
+                    return Err(UpdateError::Overflow(transaction.tx));
+                };
+                self.available = available;
+
+                self.disputable_transactions
+                    .insert(transaction.tx, self.transaction_history.len() - 1);
             }
             TransactionKind::Dispute => {
-                let Some(disputed) = self.transaction_history.get(&transaction.tx) else {
+                let Some(disputed) = self
+                    .disputable_transactions
+                    .get(&transaction.tx)
+                    .map(|&i| &self.transaction_history[i])
+                else {
                     tracing::warn!("tried to dispute invalid transaction id {}", transaction.tx);
                     return Ok(());
                 };
 
+                if !matches!(disputed.kind, TransactionKind::Deposit) {
+                    return Err(UpdateError::DisputeWithdrawal(transaction.tx));
+                }
+
                 let Some(amount) = disputed.amount else {
-                    return Err(UpdateError::MissingAmount(
-                        disputed.tx,
-                        disputed.kind.clone(),
-                    ));
+                    return Err(UpdateError::MissingAmount(disputed.tx, disputed.kind));
                 };
 
-                self.disputed_transactions.insert(disputed.tx);
+                if !self.disputed_transactions.insert(disputed.tx) {
+                    return Err(UpdateError::AlreadyDisputed(disputed.tx));
+                }
 
-                self.available -= amount;
-                self.held += amount;
+                let Some(available) = self.available.checked_sub(amount) else {
+                    return Err(UpdateError::Overflow(transaction.tx));
+                };
+                self.available = available;
+
+                let Some(held) = self.held.checked_add(amount) else {
+                    return Err(UpdateError::Overflow(transaction.tx));
+                };
+                self.held = held;
             }
             TransactionKind::Resolve => {
-                let Some(resolved) = self.transaction_history.get(&transaction.tx) else {
-                    tracing::warn!("tried to resolve invalid transaction id {}", transaction.tx);
+                let Some(resolved) = self
+                    .disputable_transactions
+                    .get(&transaction.tx)
+                    .map(|&i| &self.transaction_history[i])
+                else {
+                    tracing::warn!(
+                        "tried to resolve undisputable transaction id {}",
+                        transaction.tx
+                    );
                     return Ok(());
                 };
 
@@ -114,22 +166,36 @@ impl ClientRecord {
                 }
 
                 let Some(amount) = resolved.amount else {
-                    return Err(UpdateError::MissingAmount(
-                        resolved.tx,
-                        resolved.kind.clone(),
-                    ));
+                    return Err(UpdateError::MissingAmount(resolved.tx, resolved.kind));
                 };
 
-                self.available += amount;
-                self.held -= amount;
+                let Some(available) = self.available.checked_add(amount) else {
+                    return Err(UpdateError::Overflow(transaction.tx));
+                };
+                self.available = available;
+
+                let Some(held) = self.held.checked_sub(amount) else {
+                    return Err(UpdateError::Overflow(transaction.tx));
+                };
+                self.held = held;
+
+                self.disputed_transactions.remove(&transaction.tx);
+                self.disputable_transactions.remove(&transaction.tx);
             }
             TransactionKind::Chargeback => {
-                let Some(resolved) = self.transaction_history.get(&transaction.tx) else {
-                    tracing::warn!("tried to resolve invalid transaction id {}", transaction.tx);
+                let Some(charged_back) = self
+                    .disputable_transactions
+                    .get(&transaction.tx)
+                    .map(|&i| &self.transaction_history[i])
+                else {
+                    tracing::warn!(
+                        "tried to chargeback undisputable transaction id {}",
+                        transaction.tx
+                    );
                     return Ok(());
                 };
 
-                if !self.disputed_transactions.contains(&resolved.tx) {
+                if !self.disputed_transactions.contains(&charged_back.tx) {
                     tracing::warn!(
                         "tried to chargeback an undisputed transaction id {}",
                         transaction.tx
@@ -137,19 +203,33 @@ impl ClientRecord {
                     return Ok(());
                 }
 
-                let Some(amount) = resolved.amount else {
+                let Some(amount) = charged_back.amount else {
                     return Err(UpdateError::MissingAmount(
-                        resolved.tx,
-                        resolved.kind.clone(),
+                        charged_back.tx,
+                        charged_back.kind,
                     ));
                 };
 
-                self.held -= amount;
-                self.total -= amount;
+                let Some(held) = self.held.checked_sub(amount) else {
+                    return Err(UpdateError::Overflow(transaction.tx));
+                };
+                self.held = held;
+
                 self.locked = true;
+
+                self.disputed_transactions.remove(&transaction.tx);
+                self.disputable_transactions.remove(&transaction.tx);
             }
-            TransactionKind::Unknown(_) => {}
+            TransactionKind::Unknown => {
+                return Err(UpdateError::UnknownTransactionType(transaction.tx));
+            }
         }
+
+        // Make sure `total` is always correct
+        let Some(total) = self.available.checked_add(self.held) else {
+            return Err(UpdateError::Overflow(transaction.tx));
+        };
+        self.total = total;
 
         Ok(())
     }

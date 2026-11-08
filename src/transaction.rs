@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::ClientId;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Copy, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Deposit,
@@ -13,9 +13,8 @@ pub enum Kind {
     Dispute,
     Resolve,
     Chargeback,
-    #[serde(untagged)]
-    #[allow(unused)]
-    Unknown(String),
+    #[serde(other)]
+    Unknown,
 }
 
 #[repr(transparent)]
