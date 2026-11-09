@@ -33,6 +33,7 @@ pub enum UpdateError {
 pub struct ClientId(u16);
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(Clone, PartialEq))]
 pub struct ClientRecord {
     client: ClientId,
     #[serde(serialize_with = "serialize_amount")]
@@ -89,7 +90,7 @@ impl ClientRecord {
                 let Some(available) = self.available.checked_add(amount) else {
                     return Err(UpdateError::Overflow(transaction.tx));
                 };
-                self.available = available;
+                self.set_balances(transaction.tx, available, self.held)?;
 
                 self.deposits.insert(transaction.tx, amount);
             }
@@ -109,7 +110,7 @@ impl ClientRecord {
                 let Some(available) = self.available.checked_sub(amount) else {
                     return Err(UpdateError::Overflow(transaction.tx));
                 };
-                self.available = available;
+                self.set_balances(transaction.tx, available, self.held)?;
 
                 self.withdrawals.insert(transaction.tx);
             }
@@ -132,8 +133,7 @@ impl ClientRecord {
                 ) else {
                     return Err(UpdateError::Overflow(transaction.tx));
                 };
-                self.available = available;
-                self.held = held;
+                self.set_balances(transaction.tx, available, held)?;
 
                 self.disputed.insert(transaction.tx);
             }
@@ -160,8 +160,7 @@ impl ClientRecord {
                 ) else {
                     return Err(UpdateError::Overflow(transaction.tx));
                 };
-                self.available = available;
-                self.held = held;
+                self.set_balances(transaction.tx, available, held)?;
 
                 self.disputed.remove(&transaction.tx);
                 self.deposits.remove(&transaction.tx);
@@ -186,7 +185,7 @@ impl ClientRecord {
                 let Some(held) = self.held.checked_sub(amount) else {
                     return Err(UpdateError::Overflow(transaction.tx));
                 };
-                self.held = held;
+                self.set_balances(transaction.tx, self.available, held)?;
 
                 self.locked = true;
 
@@ -200,12 +199,22 @@ impl ClientRecord {
             }
         }
 
-        // Make sure `total` is always correct
-        let Some(total) = self.available.checked_add(self.held) else {
-            return Err(UpdateError::Overflow(transaction.tx));
-        };
-        self.total = total;
+        Ok(())
+    }
 
+    /// Sets both balances and `total` together, or changes nothing if `total` would overflow.
+    fn set_balances(
+        &mut self,
+        tx: TransactionId,
+        available: Decimal,
+        held: Decimal,
+    ) -> Result<(), UpdateError> {
+        let Some(total) = available.checked_add(held) else {
+            return Err(UpdateError::Overflow(tx));
+        };
+        self.available = available;
+        self.held = held;
+        self.total = total;
         Ok(())
     }
 }
@@ -467,6 +476,39 @@ mod tests {
         assert!(matches!(result, Err(UpdateError::Overflow(_))));
         assert!(record.update(&tx("dispute, 1, 2,")).is_ok());
         assert_account(&record, &max, "0", &max, false);
+    }
+
+    #[test]
+    fn rejected_rows_change_nothing() {
+        let cases: &[(&[&str], &str)] = &[
+            (&[], "deposit, 1, 1,"),
+            (&[], "deposit, 1, 1, -1"),
+            (&[], "transfer, 1, 1, 5"),
+            (&["deposit, 1, 1, 10"], "withdrawal, 1, 2, 20"),
+            (
+                &["deposit, 1, 1, 10", "withdrawal, 1, 2, 1"],
+                "dispute, 1, 2,",
+            ),
+            (&["deposit, 1, 1, 10", "dispute, 1, 1,"], "dispute, 1, 1,"),
+            (
+                &["deposit, 1, 1, 10", "dispute, 1, 1,", "chargeback, 1, 1,"],
+                "deposit, 1, 2, 5",
+            ),
+            // `available` fits, but `available + held` overflows.
+            (
+                &[
+                    "deposit, 1, 1, 50000000000000000000000000000",
+                    "dispute, 1, 1,",
+                ],
+                "deposit, 1, 2, 50000000000000000000000000000",
+            ),
+        ];
+        for (setup, row) in cases {
+            let mut record = apply(setup);
+            let before = record.clone();
+            assert!(record.update(&tx(row)).is_err(), "`{row}` is rejected");
+            assert_eq!(record, before, "`{row}` changes nothing");
+        }
     }
 
     #[test]

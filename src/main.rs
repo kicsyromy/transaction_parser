@@ -1,6 +1,10 @@
 use std::collections::hash_map::Entry;
 use std::process::ExitCode;
-use std::{collections::HashMap, io::IsTerminal};
+use std::{
+    collections::HashMap,
+    io::{BufWriter, IsTerminal},
+    sync::Mutex,
+};
 
 use client_record::{ClientId, ClientRecord};
 use transaction::Transaction;
@@ -17,8 +21,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut clients = HashMap::<ClientId, ClientRecord>::new();
 
     let mut rdr = transaction::csv_reader_builder().from_path(input_file)?;
-    for result in rdr.deserialize() {
-        let transaction: Transaction = result?;
+    let headers = rdr.headers()?.clone();
+    let mut record = csv::StringRecord::new();
+    while rdr.read_record(&mut record)? {
+        // A line of only whitespace trims to empty fields; skip it like an empty line.
+        if record.iter().all(str::is_empty) {
+            continue;
+        }
+        let transaction: Transaction = record.deserialize(Some(&headers))?;
         match clients.entry(transaction.client) {
             Entry::Occupied(oe) => {
                 let client = oe.into_mut();
@@ -51,10 +61,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
+    let subscriber = tracing_subscriber::fmt()
         .with_ansi(std::io::stderr().is_terminal())
-        .with_writer(std::io::stderr)
-        .init();
+        .with_writer(Mutex::new(BufWriter::new(std::io::stderr())))
+        .finish();
+    // Dropping the guard when `main` returns drops the buffer, which flushes it.
+    let _log_guard = tracing::subscriber::set_default(subscriber);
 
     if let Err(err) = run() {
         tracing::error!("execution failed: {err}");

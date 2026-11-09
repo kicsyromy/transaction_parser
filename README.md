@@ -100,7 +100,7 @@ cargo clippy --all-targets
 
 ### Input
 
-- Whitespace around headers and fields is trimmed.
+- Whitespace around headers and fields is trimmed. Lines that contain only whitespace are skipped.
 - Type names are lowercase. Any other value, including `Deposit`, is an unknown type; the row is
   skipped and logged.
 - Transaction IDs are assumed to be unique, as the specification guarantees. Duplicates are not

@@ -89,6 +89,11 @@ fn empty_input() {
 }
 
 #[test]
+fn whitespace_lines() {
+    check_fixture("whitespace_lines");
+}
+
+#[test]
 fn limitation_ignored_dispute_creates_account() {
     check_fixture("limitation_ignored_dispute_creates_account");
 }
